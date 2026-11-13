@@ -16,6 +16,24 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
+rem Веб-интерфейс (Vue) уже собран в trainwatch\static. Если его нет — собираем (нужен Node.js 20.19+).
+if not exist "trainwatch\static\index.html" (
+  where npm >nul 2>nul
+  if errorlevel 1 (
+    echo Не найден собранный интерфейс и не установлен Node.js. Установите Node.js с https://nodejs.org и запустите снова.
+    pause
+    exit /b 1
+  )
+  echo Собираю веб-интерфейс...
+  pushd frontend
+  call npm ci --no-audit --no-fund && call npm run build
+  popd
+  if not exist "trainwatch\static\index.html" (
+    echo Не удалось собрать интерфейс.
+    pause
+    exit /b 1
+  )
+)
 echo trainwatch запускается: интерфейс откроется в браузере. Не закрывайте это окно.
 ".venv\Scripts\python.exe" -m trainwatch run
 pause

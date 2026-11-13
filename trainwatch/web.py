@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import secrets
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
@@ -13,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ValidationError
 
 from . import __version__
+from .auth import COOKIE, REMEMBER_SECONDS
 from .config import RuntimeSettings, WatchConfig
 from .fetcher import FetchError
 from .monitor import by_number
@@ -25,6 +25,38 @@ if TYPE_CHECKING:
 
 STATIC = Path(__file__).parent / "static"
 MASK = "••••••"
+# Без входа доступны: страница приложения и его код (там нет данных — данные только в /api),
+# проверка здоровья, файлы, которые браузер запрашивает без cookie (манифест, Service Worker, иконки).
+PUBLIC_PATHS = {"/", "/api/health", "/sw.js", "/manifest.webmanifest"}
+AUTH_OPEN_PATHS = {"/api/auth/status", "/api/auth/login", "/api/auth/logout"}
+
+
+def is_public_asset(path: str) -> bool:
+    return path.startswith("/static/")
+
+
+def is_https(request: Request) -> bool:
+    # за прокси хостинга (Railway) приложение видит http, исходный протокол — в заголовке
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    return proto.split(",")[0].strip() == "https"
+
+
+def same_origin(request: Request) -> bool:
+    origin = request.headers.get("origin")
+    if not origin or origin == "null":
+        return True                 # не браузерный запрос или запрос со своей страницы без Origin
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
+    return urlparse(origin).netloc == host.split(",")[0].strip()
+
+
+def client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "?"
+# прокси хостингов обрывают долгие HTTP-запросы (Railway — через 15 мин); закрываем поток сами
+# раньше, браузер переподключается через 3 с (retry), интерфейс этого не замечает
+SSE_MAX_SECONDS = 10 * 60
 
 
 # ---------------------------------------------------------------- представления
@@ -128,6 +160,11 @@ class TelegramTestIn(BaseModel):
     chat_id: str | None = None
 
 
+class LoginIn(BaseModel):
+    password: str
+    remember: bool = True
+
+
 def _validate_watch(data: dict) -> WatchConfig:
     try:
         return WatchConfig.model_validate(data)
@@ -140,23 +177,75 @@ def create_app(app: "App") -> FastAPI:
     api = FastAPI(title="trainwatch", version=__version__, docs_url="/api/docs", redoc_url=None)
     store, hub, monitor = app.store, app.hub, app.monitor
 
-    # ---------- необязательная защита паролем (если сервер открыт в локальную сеть) ----------
-    if app.cfg.web_password:
-        expected = app.cfg.web_password
+    # ---------- вход по паролю (если задан WEB_PASSWORD) ----------
+    auth = app.auth
 
-        @api.middleware("http")
-        async def basic_auth(request: Request, call_next):
-            h = request.headers.get("authorization", "")
-            ok = False
-            if h.lower().startswith("basic "):
-                try:
-                    _, _, pwd = base64.b64decode(h[6:]).decode().partition(":")
-                    ok = secrets.compare_digest(pwd, expected)
-                except Exception:
-                    ok = False
-            if not ok:
-                return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="trainwatch"'})
+    def set_session(resp: Response, request: Request, remember: bool) -> None:
+        token, max_age = auth.issue(remember)
+        resp.set_cookie(
+            COOKIE, token, max_age=max_age, httponly=True, samesite="lax", path="/",
+            secure=is_https(request),
+        )
+
+    @api.middleware("http")
+    async def require_session(request: Request, call_next):
+        path = request.url.path
+        # подделка запроса с чужого сайта: изменяющий запрос с чужим Origin — отклоняем
+        if request.method not in ("GET", "HEAD", "OPTIONS") and not same_origin(request):
+            return JSONResponse({"detail": "Запрос с чужого сайта отклонён"}, status_code=403)
+        if not auth.enabled or path in PUBLIC_PATHS or path in AUTH_OPEN_PATHS or is_public_asset(path):
             return await call_next(request)
+        payload = auth.verify(request.cookies.get(COOKIE))
+        if payload is None:
+            return JSONResponse({"detail": "Требуется вход"}, status_code=401)
+        resp = await call_next(request)
+        if auth.should_renew(payload):          # активный пользователь не вылетает через 30 дней
+            set_session(resp, request, remember=True)
+        return resp
+
+    @api.get("/api/auth/status")
+    async def auth_status(request: Request):
+        return {
+            "required": auth.enabled,
+            "authenticated": (not auth.enabled) or auth.verify(request.cookies.get(COOKIE)) is not None,
+            "remember_days": REMEMBER_SECONDS // 86400,
+        }
+
+    @api.post("/api/auth/login")
+    async def auth_login(body: LoginIn, request: Request):
+        if not auth.enabled:
+            return {"ok": True}
+        client = client_ip(request)
+        wait = auth.retry_after(client)
+        if wait:
+            raise HTTPException(429, f"Слишком много попыток. Повторите через {max(1, round(wait / 60))} мин.",
+                                headers={"Retry-After": str(wait)})
+        if not auth.check_password(body.password):
+            left = auth.record_failure(client)
+            await asyncio.sleep(0.4)            # замедляет перебор
+            msg = "Неверный пароль." + (f" Осталось попыток: {left}." if left <= 2 else "")
+            if left == 0:
+                msg = "Неверный пароль. Вход заблокирован на 15 минут."
+            raise HTTPException(401, msg)
+        auth.reset_failures(client)
+        resp = JSONResponse({"ok": True})
+        set_session(resp, request, body.remember)
+        return resp
+
+    @api.post("/api/auth/logout")
+    async def auth_logout():
+        resp = JSONResponse({"ok": True})
+        resp.delete_cookie(COOKIE, path="/")
+        return resp
+
+    @api.post("/api/auth/logout-all")
+    async def auth_logout_all():
+        """Завершить все сессии на всех устройствах (требует входа — см. middleware)."""
+        if auth.enabled:
+            auth.rotate()
+        resp = JSONResponse({"ok": True})
+        resp.delete_cookie(COOKIE, path="/")
+        return resp
 
     # ---------- статика ----------
     api.mount("/static", StaticFiles(directory=STATIC), name="static")
@@ -164,6 +253,11 @@ def create_app(app: "App") -> FastAPI:
     @api.get("/", include_in_schema=False)
     async def index():
         return FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-cache"})
+
+    @api.get("/api/health", include_in_schema=False)
+    async def health():
+        """Для проверки хостингом при деплое и перезапусках: процесс жив и отвечает."""
+        return {"ok": True, "version": __version__}
 
     @api.get("/sw.js", include_in_schema=False)
     async def service_worker():
@@ -201,9 +295,11 @@ def create_app(app: "App") -> FastAPI:
         q = hub.broker.subscribe()
 
         async def gen():
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + SSE_MAX_SECONDS
             try:
                 yield "retry: 3000\n\n"
-                while True:
+                while loop.time() < deadline:
                     if await request.is_disconnected():
                         break
                     try:
@@ -218,9 +314,16 @@ def create_app(app: "App") -> FastAPI:
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     @api.get("/api/history/{watch_id}")
-    async def history(watch_id: str, hours: float = 48):
+    async def history(watch_id: str, hours: float = 48, max_points: int = 0):
+        """Для графика. max_points>0 — сжатие под ширину экрана (ступенчатая линия не меняется)."""
         since = utcnow() - timedelta(hours=hours) if hours > 0 else None
-        return store.history(watch_id, since)
+        mp = max(20, min(max_points, 5000)) if max_points > 0 else None
+        return store.history(watch_id, since, mp)
+
+    @api.get("/api/checks/{watch_id}")
+    async def checks(watch_id: str, before: int | None = None, after: int | None = None, limit: int = 20):
+        """Журнал проверок для таблицы — постранично, от новых к старым."""
+        return store.checks_page(watch_id, before, after, max(1, min(limit, 100)))
 
     @api.get("/api/events")
     async def events(watch_id: str | None = None, kinds: str | None = None,

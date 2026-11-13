@@ -122,6 +122,11 @@ class AppConfig(BaseModel):
         return self.data_dir / "state.sqlite3"
 
 
+def on_public_hosting() -> bool:
+    """Запущены на публичном хостинге (интерфейс доступен из интернета)."""
+    return any(os.environ.get(k) for k in ("RAILWAY_PROJECT_ID", "RAILWAY_ENVIRONMENT", "RAILWAY_SERVICE_ID"))
+
+
 _RUNTIME_KEYS = set(RuntimeSettings.model_fields)
 # старые имена ключей config.yaml
 _LEGACY = {"check_interval_seconds": ("check_interval_minutes", lambda v: max(1, v / 60))}
@@ -146,11 +151,15 @@ def load_app_config(path: str | os.PathLike = "config.yaml") -> AppConfig:
     cfg = AppConfig(
         data_dir=Path(env.get("DATA_DIR") or raw.get("data_dir") or "data"),
         host=env.get("WEB_HOST") or raw.get("web_host") or "127.0.0.1",
-        port=int(env.get("WEB_PORT") or raw.get("web_port") or 8765),
+        # PORT задаёт хостинг (Railway, Render, Heroku…) — он важнее нашего WEB_PORT
+        port=int(env.get("PORT") or env.get("WEB_PORT") or raw.get("web_port") or 8765),
         open_browser=(env.get("OPEN_BROWSER", "1") not in ("0", "false", "no")) and raw.get("open_browser", True),
         request_timeout_seconds=int(raw.get("request_timeout_seconds", 40)),
         web_password=env.get("WEB_PASSWORD", "").strip(),
-        vapid_subject=env.get("VAPID_SUBJECT", "").strip() or "mailto:trainwatch@example.com",
+        # контакт для push-сервисов (Apple требует настоящий): на Railway — адрес самого сервиса
+        vapid_subject=env.get("VAPID_SUBJECT", "").strip()
+        or (f"https://{env['RAILWAY_PUBLIC_DOMAIN']}" if env.get("RAILWAY_PUBLIC_DOMAIN") else "")
+        or "mailto:trainwatch@example.com",
         env_telegram_token=env.get("TELEGRAM_BOT_TOKEN", "").strip(),
         env_telegram_chat_id=env.get("TELEGRAM_CHAT_ID", "").strip(),
         seed_settings=seed,

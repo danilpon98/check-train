@@ -10,7 +10,7 @@ import sys
 import webbrowser
 from pathlib import Path
 
-from .config import WatchConfig, load_app_config
+from .config import WatchConfig, load_app_config, on_public_hosting
 from .fetcher import Fetcher
 from .monitor import by_number
 from .parser import parse_page
@@ -47,6 +47,11 @@ def cmd_run(config: str) -> None:
     from .app import App
 
     cfg = load_app_config(config)
+    if on_public_hosting() and not cfg.web_password:
+        # без пароля любой, кто узнает адрес, сможет менять поезда и настройки (в т.ч. Telegram)
+        print("ОШИБКА: сервис запущен на публичном хостинге без пароля.\n"
+              "Задайте переменную WEB_PASSWORD (Railway → сервис → Variables) и перезапустите.", file=sys.stderr)
+        sys.exit(2)
     if port_busy(cfg.host, cfg.port):
         url = f"http://localhost:{cfg.port}/"
         print(f"Порт {cfg.port} занят — похоже, trainwatch уже запущен. Открываю {url}")

@@ -1,0 +1,10 @@
+# не загружать на Railway (railway up): секреты, локальные данные, зависимости, кэши
+.env
+config.yaml
+data/
+.venv/
+**/__pycache__/
+.pytest_cache/
+frontend/node_modules/
+trainwatch/static/
+tests/

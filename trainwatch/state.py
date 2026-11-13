@@ -106,6 +106,7 @@ class Store:
                 total_free INTEGER, cars INTEGER, cabins INTEGER, error TEXT
             );
             CREATE INDEX IF NOT EXISTS checks_watch_at ON checks(watch_id, at);
+            CREATE INDEX IF NOT EXISTS checks_watch_id ON checks(watch_id, id);
             CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 watch_id TEXT, at TEXT NOT NULL, kind TEXT NOT NULL,
@@ -282,14 +283,34 @@ class Store:
                 self._insert_message(text, silent, utcnow().isoformat())
 
     # ---------- history / events ----------
-    def history(self, watch_id: str, since: datetime | None = None) -> list[dict]:
+    def history(self, watch_id: str, since: datetime | None = None, max_points: int | None = None) -> list[dict]:
+        """История для графика. С max_points — сжатая (см. history.downsample)."""
         q = "SELECT at, ok, total_free, cars, cabins, error FROM checks WHERE watch_id=?"
         args: list = [watch_id]
         if since:
             q += " AND at>=?"
             args.append(since.isoformat())
-        rows = self._db.execute(q + " ORDER BY at", args).fetchall()
-        return [dict(r) for r in rows]
+        rows = [dict(r) for r in self._db.execute(q + " ORDER BY at", args).fetchall()]
+        if max_points:
+            from .history import downsample
+            rows = downsample(rows, max_points)
+        return rows
+
+    def checks_page(self, watch_id: str, before_id: int | None = None, after_id: int | None = None,
+                    limit: int = 20) -> list[dict]:
+        """Журнал проверок для таблицы, от новых к старым, курсором по id.
+        before_id — следующая страница (старее), after_id — только новые с прошлого раза."""
+        q = "SELECT id, at, ok, total_free, cars, cabins, error FROM checks WHERE watch_id=?"
+        args: list = [watch_id]
+        if before_id:
+            q += " AND id<?"
+            args.append(before_id)
+        if after_id:
+            q += " AND id>?"
+            args.append(after_id)
+        q += " ORDER BY id DESC LIMIT ?"
+        args.append(limit)
+        return [dict(r) for r in self._db.execute(q, args).fetchall()]
 
     def events(self, watch_id: str | None = None, kinds: list[str] | None = None,
                before_id: int | None = None, limit: int = 50) -> list[dict]:

@@ -354,7 +354,8 @@ class Monitor:
                 html = await self.fetch(url)
             finally:
                 self._last_request = loop.time()
-        return parse_page(html)
+        # разбор ~100 мс CPU — в отдельном потоке, чтобы не задерживать ответы веб-интерфейсу
+        return await asyncio.to_thread(parse_page, html)
 
     async def check(self, watch_id: str) -> float:
         """Одна проверка. Возвращает паузу до следующей (секунды), -1 — отслеживание завершено."""
@@ -424,7 +425,10 @@ class Monitor:
     async def run_watch(self, watch_id: str, start_delay: float) -> None:
         loop = asyncio.get_running_loop()
         await asyncio.sleep(start_delay)
+        ev = self._wake[watch_id]
         while True:
+            # сигнал сбрасываем ДО проверки: смена интервала во время проверки не потеряется
+            ev.clear()
             try:
                 delay = await self.check(watch_id)
             except asyncio.CancelledError:
@@ -441,13 +445,12 @@ class Monitor:
                 return
             started = loop.time()
             wall_start = utcnow()
-            ev = self._wake[watch_id]
             while (remaining := started + delay - loop.time()) > 0:
-                ev.clear()
                 try:
                     await asyncio.wait_for(ev.wait(), timeout=remaining)
                 except asyncio.TimeoutError:
                     break
+                ev.clear()
                 if watch_id in self._reset:       # была ручная проверка — отсчёт заново от неё
                     self._reset.discard(watch_id)
                     started, wall_start = loop.time(), utcnow()

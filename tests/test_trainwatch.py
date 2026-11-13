@@ -21,6 +21,16 @@ NOW = datetime(2026, 11, 12, 12, 0, tzinfo=timezone.utc)
 CARS_HTML = (FIX / "cars.html").read_text(encoding="utf-8")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_from_local_env(monkeypatch):
+    """Тесты не должны видеть локальный .env разработчика (пароль, токен Telegram и т.п.)."""
+    import trainwatch.config
+    monkeypatch.setattr(trainwatch.config, "load_dotenv", lambda *a, **k: False)
+    for k in ("WEB_PASSWORD", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "WEB_PORT", "PORT", "DATA_DIR",
+              "VAPID_SUBJECT", "RAILWAY_PROJECT_ID", "RAILWAY_ENVIRONMENT", "RAILWAY_SERVICE_ID", "RAILWAY_PUBLIC_DOMAIN"):
+        monkeypatch.delenv(k, raising=False)
+
+
 def free_up_cabin(html: str, car: str, cabin_index: int) -> str:
     soup = BeautifulSoup(html, "html.parser")
     cab = soup.find("tr", id=f"car-forward-{car}").select("div.cabin")[cabin_index]
@@ -259,9 +269,15 @@ def client(tmp_path):
 def test_web_index_and_static(client):
     r = client.get("/")
     assert r.status_code == 200 and "trainwatch" in r.text
+    assert '<div id="app">' in r.text                     # собранное Vue-приложение
     assert client.get("/sw.js").headers["service-worker-allowed"] == "/"
-    assert client.get("/static/app.js").status_code == 200
     assert client.get("/manifest.webmanifest").json()["short_name"] == "trainwatch"
+    # все ассеты, на которые ссылается index.html, реально отдаются
+    import re
+    assets = re.findall(r'(?:src|href)="(/static/[^"]+)"', r.text)
+    assert any(a.endswith(".js") for a in assets) and any(a.endswith(".css") for a in assets)
+    for a in assets:
+        assert client.get(a).status_code == 200, a
 
 
 def test_web_watch_lifecycle(client):
@@ -392,14 +408,14 @@ def test_interval_change_and_manual_check_reschedule(tmp_path):
 
 
 # ---------------- фронтенд и Web Push
-@pytest.mark.parametrize("name", ["app.js", "sw.js"])
-def test_frontend_js_syntax(name):
+def test_service_worker_syntax():
+    """sw.js не проходит через сборщик — проверяем его синтаксис отдельно (Vue-код проверяет vue-tsc)."""
     import shutil
     import subprocess
     node = shutil.which("node")
     if not node:
         pytest.skip("node не установлен")
-    path = Path(__file__).parent.parent / "trainwatch" / "static" / name
+    path = Path(__file__).parent.parent / "trainwatch" / "static" / "sw.js"
     r = subprocess.run([node, "--check", str(path)], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
 
@@ -455,3 +471,255 @@ def test_webpush_real_encryption_and_vapid(tmp_path):
         assert PushService(store, tmp_path, "mailto:t@e.com").public_key == push.public_key
     finally:
         srv.shutdown()
+
+
+# ---------------- история: сжатие для графика и журнал для таблицы
+from trainwatch.history import bucket, collapse_runs, downsample
+
+
+def _hist(values, start=NOW, step_min=15):
+    """values: число мест, None — неудачная проверка, (мест, кабинок) — с кабинкой."""
+    out = []
+    for i, v in enumerate(values):
+        at = (start + timedelta(minutes=step_min * i)).isoformat()
+        if v is None:
+            out.append({"at": at, "ok": 0, "total_free": None, "cars": None, "cabins": None, "error": "HTTP 503"})
+        else:
+            free, cab = v if isinstance(v, tuple) else (v, 0)
+            out.append({"at": at, "ok": 1, "total_free": free, "cars": 8, "cabins": cab, "error": None})
+    return out
+
+
+def _step_line(rows):
+    """Значение ступенчатой линии в каждый момент исходных проверок."""
+    pts = [(r["at"], r["total_free"]) for r in rows if r["ok"]]
+    return lambda at: [v for t, v in pts if t <= at][-1]
+
+
+def test_collapse_runs_is_lossless_for_step_chart():
+    rows = _hist([75] * 50 + [80] * 30 + [None] * 5 + [80] * 40 + [72])
+    small = collapse_runs(rows)
+    assert len(small) < 15
+    assert small[0] is rows[0] and small[-1] is rows[-1]
+    full, comp = _step_line(rows), _step_line(small)
+    assert all(full(r["at"]) == comp(r["at"]) for r in rows if r["ok"])   # линия та же
+    assert sum(1 for r in small if not r["ok"]) == 5                        # ни одна ошибка не потерялась
+
+
+def test_bucket_lone_cabin_and_failure_in_same_interval_both_survive():
+    vals = [70 + (i % 7) for i in range(3000)]
+    vals[1500] = (71, 1)
+    vals[1502] = None                                  # в том же интервале, что и кабинка
+    out = downsample(_hist(vals, step_min=1), 300)
+    assert sum(1 for r in out if r["ok"] and r["cabins"]) == 1
+    assert sum(1 for r in out if not r["ok"]) == 1
+
+
+def test_bucket_keeps_cabins_and_failures():
+    vals = [70 + (i % 7) for i in range(3000)]       # «шумные» данные: схлопывать нечего
+    vals[1234] = (71, 1)
+    vals[2500] = None
+    rows = _hist(vals, step_min=1)
+    out = downsample(rows, 200)
+    assert len(out) <= 200 + 2
+    assert any(r["cabins"] for r in out if r["ok"])                 # момент с кабинкой сохранён
+    assert any(not r["ok"] for r in out)                             # неудачная проверка сохранена
+    assert out[0]["at"] == rows[0]["at"] and out[-1]["at"] == rows[-1]["at"]
+    assert [r["at"] for r in out] == sorted(r["at"] for r in out)    # порядок по времени
+
+
+def test_bucket_noop_when_small():
+    rows = _hist([1, 2, 3])
+    assert bucket(rows, 100) == rows
+
+
+def test_checks_page_cursor(tmp_path):
+    store = Store(tmp_path / "db.sqlite3")
+    st = WatchState("w")
+    for i in range(45):
+        store.save_watch(st, check={"at": (NOW + timedelta(minutes=i)).isoformat(), "ok": True,
+                                    "total_free": i, "cars": 8, "cabins": 0})
+    p1 = store.checks_page("w", limit=20)
+    assert [r["total_free"] for r in p1[:3]] == [44, 43, 42]           # от новых к старым
+    p2 = store.checks_page("w", before_id=p1[-1]["id"], limit=20)
+    p3 = store.checks_page("w", before_id=p2[-1]["id"], limit=20)
+    assert len(p1) == 20 and len(p2) == 20 and len(p3) == 5
+    assert len({r["id"] for r in p1 + p2 + p3}) == 45                   # без пропусков и дублей
+    store.save_watch(st, check={"at": (NOW + timedelta(hours=2)).isoformat(), "ok": False, "error": "x"})
+    new = store.checks_page("w", after_id=p1[0]["id"])
+    assert len(new) == 1 and new[0]["ok"] == 0                          # только новые
+
+
+def test_web_history_and_checks_endpoints(client):
+    # поезд кладём прямо в базу: POST /api/watches запустил бы фоновую проверку,
+    # и она могла бы успеть дописать в историю лишнюю строку (гонка → плавающий тест)
+    store = client.app_obj.store
+    w = WatchConfig(url=URL)
+    store.upsert_watch(w)
+    wid = w.id
+    st = store.load_watch(wid)
+    for i in range(300):
+        store.save_watch(st, check={"at": (NOW + timedelta(minutes=i)).isoformat(), "ok": True,
+                                    "total_free": 70 + (i // 50), "cars": 8, "cabins": 0})
+    full = client.get(f"/api/history/{wid}?hours=0").json()
+    small = client.get(f"/api/history/{wid}?hours=0&max_points=100").json()
+    assert len(full) == 300 and len(small) <= 15                        # 6 ступеней → ~12 точек
+    page = client.get(f"/api/checks/{wid}?limit=20").json()
+    assert len(page) == 20 and page[0]["id"] > page[-1]["id"]
+    nxt = client.get(f"/api/checks/{wid}?limit=20&before={page[-1]['id']}").json()
+    assert nxt[0]["id"] < page[-1]["id"]
+    assert client.get(f"/api/checks/{wid}?limit=1000").status_code == 200
+    assert len(client.get(f"/api/checks/{wid}?limit=1000").json()) == 100   # лимит страницы
+
+
+# ---------------- развёртывание на хостинге (Railway)
+from trainwatch.config import load_app_config
+
+
+def test_port_from_hosting_overrides(monkeypatch, tmp_path):
+    monkeypatch.setenv("WEB_PORT", "8765")
+    monkeypatch.setenv("PORT", "4321")
+    assert load_app_config(tmp_path / "none.yaml").port == 4321
+    monkeypatch.delenv("PORT")
+    assert load_app_config(tmp_path / "none.yaml").port == 8765
+
+
+def test_vapid_subject_uses_public_domain(monkeypatch, tmp_path):
+    monkeypatch.delenv("VAPID_SUBJECT", raising=False)
+    monkeypatch.setenv("RAILWAY_PUBLIC_DOMAIN", "trainwatch-production.up.railway.app")
+    assert load_app_config(tmp_path / "none.yaml").vapid_subject == "https://trainwatch-production.up.railway.app"
+
+
+def test_refuses_to_start_publicly_without_password(monkeypatch, tmp_path, capsys):
+    from trainwatch.__main__ import cmd_run
+    monkeypatch.setenv("RAILWAY_PROJECT_ID", "p1")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("WEB_PASSWORD", raising=False)
+    with pytest.raises(SystemExit) as e:
+        cmd_run(str(tmp_path / "none.yaml"))
+    assert e.value.code == 2 and "WEB_PASSWORD" in capsys.readouterr().err
+
+
+# ---------------- вход по паролю и сессии
+from trainwatch.auth import COOKIE, MAX_FAILURES, REMEMBER_SECONDS, SHORT_SECONDS, Auth
+
+
+class Clock:
+    def __init__(self, t=1_800_000_000.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+def test_session_token_lifetime_and_renewal(tmp_path):
+    clock = Clock()
+    a = Auth(tmp_path, "s3cret", clock=clock)
+    tok, max_age = a.issue(remember=True)
+    assert max_age == REMEMBER_SECONDS and a.verify(tok)["rem"] is True
+    assert not a.should_renew(a.verify(tok))
+    clock.t += 2 * 86400                                   # через 2 дня — пора продлить
+    assert a.should_renew(a.verify(tok))
+    clock.t += REMEMBER_SECONDS                            # через 30+ дней — истёк
+    assert a.verify(tok) is None
+
+    short, max_age = a.issue(remember=False)
+    assert max_age is None                                 # cookie до закрытия браузера
+    clock.t += SHORT_SECONDS + 1
+    assert a.verify(short) is None                         # и не дольше 12 часов
+
+
+def test_session_invalidated_by_tamper_rotate_and_password_change(tmp_path):
+    a = Auth(tmp_path, "s3cret")
+    tok, _ = a.issue(True)
+    body, sig = tok.rsplit(".", 1)
+    assert a.verify(body + "x." + sig) is None             # подделка
+    assert Auth(tmp_path, "s3cret").verify(tok)            # перезапуск сервиса — сессия жива
+    assert Auth(tmp_path, "new-password").verify(tok) is None   # сменили пароль — все вышли
+    a.rotate()
+    assert a.verify(tok) is None                           # «выйти на всех устройствах»
+
+
+def test_bruteforce_lockout(tmp_path):
+    clock = Clock()
+    a = Auth(tmp_path, "s3cret", clock=clock)
+    for _ in range(MAX_FAILURES):
+        assert a.retry_after("1.2.3.4") is None
+        a.record_failure("1.2.3.4")
+    assert a.retry_after("1.2.3.4") > 0
+    assert a.retry_after("5.6.7.8") is None                # другой адрес не затронут
+    clock.t += 15 * 60 + 1
+    assert a.retry_after("1.2.3.4") is None                # блокировка снята
+
+
+@pytest.fixture
+def secured(tmp_path):
+    app = App(AppConfig(data_dir=tmp_path, open_browser=False, web_password="s3cret"), fetch=FakeSite())
+    with TestClient(create_app(app), base_url="https://tw.example") as c:
+        c.app_obj = app
+        yield c
+    app.store.close()
+
+
+def test_login_page_flow(secured):
+    c = secured
+    # страница и её код открываются, данные — нет
+    assert c.get("/").status_code == 200
+    assert c.get("/api/auth/status").json() == {"required": True, "authenticated": False, "remember_days": 30}
+    for path in ("/api/state", "/api/settings", "/api/stream", "/api/events", "/api/docs"):
+        assert c.get(path).status_code == 401, path
+    # файлы, которые браузер берёт без cookie, — без входа
+    assert c.get("/api/health").json()["ok"] is True
+    for path in ("/sw.js", "/manifest.webmanifest", "/static/icon-192.png"):
+        assert c.get(path).status_code == 200, path
+
+    r = c.post("/api/auth/login", json={"password": "wrong"})
+    assert r.status_code == 401 and "Неверный пароль" in r.json()["detail"]
+
+    r = c.post("/api/auth/login", json={"password": "s3cret", "remember": True})
+    assert r.status_code == 200
+    cookie = r.headers["set-cookie"]
+    assert COOKIE in cookie and "HttpOnly" in cookie and "SameSite=lax" in cookie
+    assert "Secure" in cookie and f"Max-Age={REMEMBER_SECONDS}" in cookie
+    assert c.get("/api/state").status_code == 200
+    assert c.get("/api/auth/status").json()["authenticated"] is True
+
+    c.post("/api/auth/logout")
+    assert c.get("/api/state").status_code == 401
+
+
+def test_login_without_remember_sets_browser_session_cookie(secured):
+    r = secured.post("/api/auth/login", json={"password": "s3cret", "remember": False})
+    assert "Max-Age" not in r.headers["set-cookie"] and "expires" not in r.headers["set-cookie"].lower()
+
+
+def test_logout_everywhere(secured, tmp_path):
+    c = secured
+    c.post("/api/auth/login", json={"password": "s3cret"})
+    other = c.cookies.get(COOKIE)                          # «другое устройство» с той же сессией
+    assert c.post("/api/auth/logout-all").status_code == 200
+    c.cookies.set(COOKIE, other)
+    assert c.get("/api/state").status_code == 401
+
+
+def test_login_bruteforce_returns_429(secured):
+    c = secured
+    for _ in range(MAX_FAILURES):
+        c.post("/api/auth/login", json={"password": "nope"})
+    r = c.post("/api/auth/login", json={"password": "s3cret"})   # даже верный — пока заблокировано
+    assert r.status_code == 429 and int(r.headers["retry-after"]) > 0
+
+
+def test_cross_site_requests_rejected(secured):
+    c = secured
+    c.post("/api/auth/login", json={"password": "s3cret"})
+    evil = {"Origin": "https://evil.example"}
+    assert c.put("/api/settings", json={"check_interval_minutes": 1}, headers=evil).status_code == 403
+    assert c.post("/api/auth/login", json={"password": "s3cret"}, headers=evil).status_code == 403
+    ok = {"Origin": "https://tw.example"}
+    assert c.put("/api/settings", json={"check_interval_minutes": 20}, headers=ok).status_code == 200
+
+
+def test_no_password_means_open_access(client):
+    assert client.get("/api/auth/status").json()["required"] is False
+    assert client.get("/api/state").status_code == 200

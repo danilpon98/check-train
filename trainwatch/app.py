@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import logging
 import webbrowser
 
@@ -10,6 +11,7 @@ from pydantic import ValidationError
 
 from .config import AppConfig, RuntimeSettings, WatchConfig
 from .fetcher import Fetcher
+from .auth import Auth
 from .hub import Hub
 from .monitor import Monitor, make_event
 from .state import Store, utcnow
@@ -27,6 +29,7 @@ class App:
         cfg.data_dir.mkdir(parents=True, exist_ok=True)
         self.store = Store(cfg.db_path)
         self.hub = Hub(self.store, cfg)
+        self.auth = Auth(cfg.data_dir, cfg.web_password)
         self.fetcher = Fetcher(cfg.request_timeout_seconds)
         self.monitor = Monitor(self.store, fetch or self.fetcher.get, self.hub)
         self.telegram = TelegramService(self.store, self.hub, self.monitor.handle_command)
@@ -42,6 +45,9 @@ class App:
 
     @property
     def url(self) -> str:
+        public = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
+        if public:                      # на хостинге — публичный адрес, а не порт внутри контейнера
+            return f"https://{public}/"
         host = "localhost" if self.cfg.host in ("127.0.0.1", "0.0.0.0", "::") else self.cfg.host
         return f"http://{host}:{self.cfg.port}/"
 

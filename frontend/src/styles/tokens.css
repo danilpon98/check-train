@@ -1,0 +1,58 @@
+/* Дизайн-токены. Тёмная тема — свои значения, а не автоматическая инверсия. */
+:root {
+  --bg: #f4f4f1;
+  --surface: #fcfcfb;
+  --surface-2: #f0f0ec;
+  --border: #e2e2dc;
+  --text: #1b1b1a;
+  --text-2: #55554f;
+  --muted: #8a8a83;
+  --accent: #2a78d6;
+  --accent-ink: #1c5cab;
+  --accent-soft: #e3eefb;
+  --good: #0ca30c;
+  --good-ink: #006300;
+  --good-soft: #e3f6e3;
+  --warn: #fab219;
+  --warn-soft: #fff4dc;
+  --crit: #d03b3b;
+  --crit-soft: #fbe6e6;
+  --seat-free: #2a78d6;
+  --seat-taken: #dcdcd6;
+  --grid: #ececE6;
+  --shadow: 0 1px 2px rgba(0, 0, 0, .05), 0 4px 16px rgba(0, 0, 0, .04);
+  --radius: 14px;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #121211;
+    --surface: #1a1a19;
+    --surface-2: #232321;
+    --border: #2f2f2c;
+    --text: #ededea;
+    --text-2: #b4b4ad;
+    --muted: #85857e;
+    --accent: #3987e5;
+    --accent-ink: #86b6ef;
+    --accent-soft: #1b2a3d;
+    --good-ink: #3fc93f;
+    --good-soft: #15291a;
+    --warn-soft: #33290f;
+    --crit-soft: #3a1a1a;
+    --seat-free: #3987e5;
+    --seat-taken: #3a3a37;
+    --grid: #2a2a27;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .4);
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #121211; --surface: #1a1a19; --surface-2: #232321; --border: #2f2f2c;
+  --text: #ededea; --text-2: #b4b4ad; --muted: #85857e; --accent: #3987e5; --accent-ink: #86b6ef;
+  --accent-soft: #1b2a3d; --good-ink: #3fc93f; --good-soft: #15291a; --warn-soft: #33290f; --crit-soft: #3a1a1a;
+  --seat-free: #3987e5; --seat-taken: #3a3a37; --grid: #2a2a27; --shadow: 0 1px 2px rgba(0, 0, 0, .4);
+  color-scheme: dark;
+}
