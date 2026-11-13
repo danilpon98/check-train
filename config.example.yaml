@@ -1,0 +1,11 @@
+# НЕОБЯЗАТЕЛЬНЫЙ файл. Поезда и настройки управляются в веб-интерфейсе и хранятся в data/state.sqlite3.
+# Если config.yaml есть при ПЕРВОМ запуске (база пустая) — поезда и настройки из него импортируются.
+
+check_interval_minutes: 15      # как часто проверять (меняется в интерфейсе и командой бота /interval)
+quiet_reports: true             # плановые отчёты в Telegram без звука; тревоги — всегда со звуком
+
+# web_port: 8765                # порт веб-интерфейса (или WEB_PORT в .env)
+
+watches:
+  - name: "046Х Туркестан → Павлодар, 27.11 23:50"
+    url: "https://bilet.railways.kz/sale/default/car/search?car_search_form%5BdepartureStation%5D=2708001&car_search_form%5BarrivalStation%5D=2708900&car_search_form%5BforwardDirection%5D%5BdepartureTime%5D=2026-11-27T23%3A50%3A00&car_search_form%5BforwardDirection%5D%5BfluentDeparture%5D=&car_search_form%5BforwardDirection%5D%5Btrain%5D=046%D0%A5&car_search_form%5BforwardDirection%5D%5BisObligativeElReg%5D=0&car_search_form%5BbackwardDirection%5D%5BdepartureTime%5D=&car_search_form%5BbackwardDirection%5D%5BfluentDeparture%5D=&car_search_form%5BbackwardDirection%5D%5Btrain%5D=&car_search_form%5BbackwardDirection%5D%5BisObligativeElReg%5D="

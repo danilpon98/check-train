@@ -1,0 +1,15 @@
+services:
+  trainwatch:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      # только localhost: Web Push работает на http://localhost, а интерфейс не виден из сети
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - ./data:/data
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
